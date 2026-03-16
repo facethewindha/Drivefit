@@ -449,6 +449,8 @@ class LabelEmbedder(nn.Module):
         labels = torch.where(drop_ids, self.scenario_num, labels)
         return labels
 
+    
+
     def forward(self, labels, train, force_drop_ids=None):
         if self.scenario_num > 0:
             use_dropout = self.dropout_prob > 0
@@ -462,6 +464,73 @@ class LabelEmbedder(nn.Module):
             labels = self.token_drop(labels, force_drop_ids)
         embeddings = self.embedding_table(labels)
         return embeddings
+    
+class BBoxEncoder(nn.Module):
+    """
+    将边界框坐标编码为向量表示，用于条件控制。
+    
+    输入: bboxes - [B, max_boxes, 4] 归一化坐标 (x1, y1, x2, y2)
+    输出: bbox_embed - [B, hidden_size] 聚合后的bbox嵌入
+    
+    设计思路:
+    1. 将每个bbox的4个坐标通过MLP编码为向量
+    2. 对多个bbox取平均得到聚合表示
+    3. 无bbox时返回可学习的null embedding
+    """
+    
+    def __init__(self, hidden_size, max_boxes=10):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.max_boxes = max_boxes
+        
+        # 坐标编码MLP: [4] -> [hidden_size]
+        # 4个输入: x1, y1, x2, y2 (归一化到0-1)
+        self.coord_mlp = nn.Sequential(
+            nn.Linear(4, hidden_size // 4),   # 4 -> 288
+            nn.SiLU(),
+            nn.Linear(hidden_size // 4, hidden_size // 2),  # 288 -> 576
+            nn.SiLU(),
+            nn.Linear(hidden_size // 2, hidden_size),  # 576 -> 1152
+        )
+        
+        # 无bbox时的null embedding (类似CFG的null token)
+        self.null_embed = nn.Parameter(torch.zeros(1, hidden_size))
+        nn.init.normal_(self.null_embed, std=0.02)
+        
+    def forward(self, bboxes, bbox_mask=None):
+        """
+        Args:
+            bboxes: [B, max_boxes, 4] 边界框坐标，归一化到0-1
+            bbox_mask: [B, max_boxes] 有效框掩码，1=有效，0=padding
+            
+        Returns:
+            bbox_embed: [B, hidden_size] 聚合后的bbox嵌入
+        """
+        B = bboxes.shape[0]
+        
+        if bbox_mask is None:
+            # 如果没有mask，假设所有非零框都有效
+            bbox_mask = (bboxes.sum(dim=-1) != 0).float()  # [B, max_boxes]
+        
+        # 编码每个bbox
+        # bboxes: [B, max_boxes, 4] -> [B, max_boxes, hidden_size]
+        bbox_embeds = self.coord_mlp(bboxes)
+        
+        # 加权平均 (根据mask)
+        # bbox_mask: [B, max_boxes] -> [B, max_boxes, 1]
+        mask_expanded = bbox_mask.unsqueeze(-1)
+        
+        # 计算每个样本有效框的数量
+        num_valid = bbox_mask.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+        
+        # 加权求和再平均
+        bbox_embed = (bbox_embeds * mask_expanded).sum(dim=1) / num_valid  # [B, hidden_size]
+        
+        # 对于没有任何有效框的样本，使用null embedding
+        no_box_mask = (bbox_mask.sum(dim=1) == 0).unsqueeze(-1)  # [B, 1]
+        bbox_embed = torch.where(no_box_mask, self.null_embed.expand(B, -1), bbox_embed)
+        
+        return bbox_embed
 
 
 #################################################################################
@@ -904,10 +973,12 @@ class DiT(nn.Module):
         patch_modulation=False,
         block_mlp_modulation=False,
         cond_mlp_modulation=False,
-        rank=2,
+        rank=4,
         scenario_num=0,
         rope=False,
         finetune_depth=28,
+        use_bbox_cond=False, 
+        max_boxes=10, 
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -934,6 +1005,9 @@ class DiT(nn.Module):
         self.y_embedder = LabelEmbedder(
             num_classes, hidden_size, class_dropout_prob, scenario_num=scenario_num
         )
+        self.use_bbox_cond = use_bbox_cond
+        if use_bbox_cond:
+            self.bbox_encoder = BBoxEncoder(hidden_size, max_boxes)
         num_patches = self.x_embedder.num_patches
 
         self.pos_embed = nn.Parameter(
@@ -1003,28 +1077,32 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y,bboxes=None, bbox_mask=None):
         x = (
             self.x_embedder(x) + self.pos_embed
         )  # (N, T, D), where T = H * W / patch_size ** 2
 
         t = self.t_embedder(t)  # (N, D)
         y = self.y_embedder(y, self.training)  # (N, D)
-        c = t + y  # (N, D)
+        if self.use_bbox_cond and bboxes is not None:
+            bbox_embed = self.bbox_encoder(bboxes, bbox_mask)  # (N, D)
+            c = t + y + bbox_embed  # 融合三种条件
+        else:
+            c = t + y
         for block in self.blocks:
             x = block(x, c)  # (N, T, D)
         x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, y, cfg_scale,bboxes=None, bbox_mask=None):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+        model_out = self.forward(combined, t, y, bboxes, bbox_mask)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.

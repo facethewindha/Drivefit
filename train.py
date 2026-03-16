@@ -148,7 +148,7 @@ def main(args):
         os.makedirs(args.results_dir, exist_ok=True)
         results_dir = f"{args.results_dir}/{args.dataset_name}"
         os.makedirs(results_dir, exist_ok=True)
-        experiment_index = len(glob(f"{results_dir}/*"))
+        experiment_index = len(glob(f"{results_dir}/*"))+1
         model_string_name = args.model.replace("/", "-")
         experiment_dir = f"{results_dir}/{experiment_index:03d}-{model_string_name}"
         checkpoint_dir = f"{experiment_dir}/checkpoints"
@@ -184,6 +184,8 @@ def main(args):
         scenario_num=args.scenario_num if args.dataset_name is not None else 0,
         rope=args.rope,
         finetune_depth=args.finetune_depth,
+        use_bbox_cond=args.use_bbox_cond,  # ← 新增
+        max_boxes=args.max_boxes, # ← 新增
     )
 
     # 1. 首先加载预训练模型（基础权重，691M参数）
@@ -244,7 +246,7 @@ def main(args):
         dataset = ImageFolder(args.data_path, transform=transform)
     else:
         dataset = CustomImageFolder(
-            args.data_path, args.boxes_path, trans_flip=True, transform=transform
+            args.data_path, args.boxes_path, trans_flip=True, bbox_coord_path=args.bbox_coord_path, max_boxes=args.max_boxes,  transform=transform
         )
     sampler = DistributedSampler(
         dataset,
@@ -289,16 +291,22 @@ def main(args):
             if args.boxes_path is None:
                 x, y = data
                 boxes_mask = None
+                bbox_coords = None
+                bbox_valid_mask = None
             else:
-                x, y, boxes_mask, _ = data
+                x, y, boxes_mask, _, bbox_coords, bbox_valid_mask = data
                 boxes_mask = boxes_mask.unsqueeze(1).to(device)
+                bbox_coords = bbox_coords.to(device)       # (B, max_boxes, 4)
+                bbox_valid_mask = bbox_valid_mask.to(device)  # (B, max_boxes)
             x = x.to(device)
             y = y.to(device)
 
             with torch.no_grad():
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            model_kwargs = dict(y=y)
+            # ============ 修改：传入 bbox 参数 ============
+            model_kwargs = dict(y=y, bboxes=bbox_coords, bbox_mask=bbox_valid_mask)
+            # ============ 修改结束 ============
             loss_dict = diffusion.training_losses(
                 model, x, t, boxes_mask, args.mask_rl, model_kwargs
             )
@@ -445,6 +453,13 @@ if __name__ == "__main__":
     parser.add_argument("--finetune_depth", type=int, default=28)
     parser.add_argument("--mask_rl", type=float, default=1)
     parser.add_argument("--noise_schedule", type=str, default="linear")
+    # ============ 在 argparse 部分新增 ============
+    parser.add_argument("--use_bbox_cond", action="store_true",
+                    help="Enable BBox conditioning for layout control")
+    parser.add_argument("--max_boxes", type=int, default=10,
+                    help="Maximum number of bboxes per image")
+    parser.add_argument("--bbox_coord_path", type=str, default=None,
+                    help="Path to bbox coordinate files (optional)")
     args = parser.parse_args()
     run()
     print(args)

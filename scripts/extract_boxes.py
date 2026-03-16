@@ -137,6 +137,17 @@ for weather in WEATHER_LABELS:
                     mask[y1:y2, x1:x2] = 1
         
         np.save(os.path.join(save_dir, f"{name}.npy"), mask)
+        # 保存坐标 (除了掩码)
+        coord_save_dir = os.path.join(OUTPUT_PATH + "_coords", weather)
+        os.makedirs(coord_save_dir, exist_ok=True)
+
+        # 保存格式: (N, 4) 的数组，N是该帧的车辆数
+        if name in object_dict:
+             coords = np.array(object_dict[name], dtype=np.float32)
+        else:
+            coords = np.zeros((0, 4), dtype=np.float32)
+
+        np.save(os.path.join(coord_save_dir, f"{name}.npy"), coords)
         weather_count += 1
     
     print(f"  ✓ {weather}: 生成 {weather_count} 个掩码")

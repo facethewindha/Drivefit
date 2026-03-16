@@ -18,10 +18,12 @@ def main(args):
         num_classes=1000,
         modulation=True,
         cond_mlp_modulation=True,
-        rank=2,
+        rank=4,
         scenario_num=5,
         rope=True,
         finetune_depth=28,
+        use_bbox_cond=True,
+        max_boxes=30,
     )
     
     # 2. 生成图片并计算FID

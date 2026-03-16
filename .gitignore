@@ -198,6 +198,8 @@ checkpoints/
 ckpts/
 exp/
 exps/
+generated_samples/
+pretrained_models/
 
 # videos / images dumps
 *.mp4
