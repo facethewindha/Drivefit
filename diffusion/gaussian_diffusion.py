@@ -25,6 +25,7 @@ def mean_flat(tensor):
 class ModelMeanType(enum.Enum):
     """
     Which type of output the model predicts.
+    枚举，表示模型预测的是什么
     """
 
     PREVIOUS_X = enum.auto()  # the model predicts x_{t-1}
@@ -34,18 +35,21 @@ class ModelMeanType(enum.Enum):
 
 class ModelVarType(enum.Enum):
     """
+    枚举，指定扩散模型在反向采样时，方差是固定的还是由模型学习得到的
     What is used as the model's output variance.
     The LEARNED_RANGE option has been added to allow the model to predict
     values between FIXED_SMALL and FIXED_LARGE, making its job easier.
     """
 
-    LEARNED = enum.auto()
-    FIXED_SMALL = enum.auto()
-    FIXED_LARGE = enum.auto()
-    LEARNED_RANGE = enum.auto()
+    LEARNED = enum.auto()#模型直接学方差，范围更自由。
+    FIXED_SMALL = enum.auto()#方差不用模型预测，直接用一个预先定义好的、偏小的方差。
+    FIXED_LARGE = enum.auto()#方差也不用模型预测，但用一套更大的固定方差。
+    LEARNED_RANGE = enum.auto()#模型预测一个范围内的方差，这个范围由 FIXED_SMALL 和 FIXED_LARGE 决定。
 
 
 class LossType(enum.Enum):
+    """枚举，表示训练时的损失函数类型"""
+    
     MSE = enum.auto()  # use raw MSE loss (and KL when learning variances)
     RESCALED_MSE = (
         enum.auto()
@@ -54,10 +58,18 @@ class LossType(enum.Enum):
     RESCALED_KL = enum.auto()  # like KL, but rescale to estimate the full VLB
 
     def is_vb(self):
+        # 当前 loss 是否属于 variational bound（变分下界）这一类。
         return self == LossType.KL or self == LossType.RESCALED_KL
 
 
 def _warmup_beta(beta_start, beta_end, num_diffusion_timesteps, warmup_frac):
+    """
+    计算预热阶段的 beta 值。
+    beta_start: 预热开始时的 beta 值
+    beta_end: 预热结束时的 beta 值
+    num_diffusion_timesteps: 总的 diffusion 步数
+    warmup_frac: 预热阶段占总步数的比例
+    """
     betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
     warmup_time = int(num_diffusion_timesteps * warmup_frac)
     betas[:warmup_time] = np.linspace(
@@ -67,6 +79,7 @@ def _warmup_beta(beta_start, beta_end, num_diffusion_timesteps, warmup_frac):
 
 
 def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_timesteps):
+    # 根据你指定的策略，生成扩散模型每一步使用的 beta 序列。
     """
     This is the deprecated API for creating beta schedules.
     See get_named_beta_schedule() for the new library of schedules.
@@ -102,6 +115,7 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
 
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps,flag=0):
+    # 按名字选一条噪声注入曲线。
     """
     Get a pre-defined beta schedule for the given name.
     The beta schedule library consists of beta schedules which remain similar
@@ -206,6 +220,13 @@ def get_named_beta_schedule(schedule_name, num_diffusion_timesteps,flag=0):
 
 def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
     """
+    根据给定的 alpha_bar（即从 t=0 到 t=1 的累积噪声水平），反推出每一步的 beta 值。
+    alpha_bar(t) = 1 - beta_1 - beta_2 - ... - beta_t
+    :param num_diffusion_timesteps: 总的 diffusion 步数
+    :param alpha_bar: 一个函数，输入 t（从 0 到 1），输出从 t=0 到 t 时累积的 (1-beta) 值
+    :param max_beta: beta 的最大值限制
+    """
+    """
     Create a beta schedule that discretizes the given alpha_t_bar function,
     which defines the cumulative product of (1-beta) over time from t = [0,1].
     :param num_diffusion_timesteps: the number of betas to produce.
@@ -246,17 +267,17 @@ class GaussianDiffusion:
         self.num_timesteps = int(betas.shape[0])
 
         alphas = 1.0 - betas
-        self.alphas_cumprod = np.cumprod(alphas, axis=0)
-        self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
-        self.alphas_cumprod_next = np.append(self.alphas_cumprod[1:], 0.0)
+        self.alphas_cumprod = np.cumprod(alphas, axis=0) #计算累计乘积 alphas_cumprod
+        self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])#前一个时间步的累计乘积
+        self.alphas_cumprod_next = np.append(self.alphas_cumprod[1:], 0.0)#下一个时间步的累计乘积
         assert self.alphas_cumprod_prev.shape == (self.num_timesteps,)
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
-        self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
+        self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)#x_0 直接采样 x_t。
+        self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)#上面同一个公式里的噪声系数
         self.log_one_minus_alphas_cumprod = np.log(1.0 - self.alphas_cumprod)
-        self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
-        self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
+        self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)#log(1−αˉt​)
+        self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)#x_t 和 epsilon 反推 x_0
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
         self.posterior_variance = (
@@ -279,6 +300,7 @@ class GaussianDiffusion:
         )
 
     def q_mean_variance(self, x_start, t):
+        # 给定原始干净样本 x_start = x_0 和时间步 t，求前向扩散分布
         """
         Get the distribution q(x_t | x_0).
         :param x_start: the [N x C x ...] tensor of noiseless inputs.
@@ -295,6 +317,7 @@ class GaussianDiffusion:
         return mean, variance, log_variance
 
     def q_sample(self, x_start, t, noise=None):
+        # 把原始干净样本 x_start = x_0 按照第 t 步的扩散强度加噪，得到 x_t
         """
         Diffuse the data for a given number of diffusion steps.
         In other words, sample from q(x_t | x_0).
@@ -313,6 +336,7 @@ class GaussianDiffusion:
         )
 
     def q_posterior_mean_variance(self, x_start, x_t, t):
+        # 给定真实原图 x_start = x_0、当前噪声图 x_t 和时间步 t，计算后验分布
         """
         Compute the mean and variance of the diffusion posterior:
             q(x_{t-1} | x_t, x_0)
@@ -337,6 +361,8 @@ class GaussianDiffusion:
     def p_mean_variance(
         self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None
     ):
+    #给定当前时刻的 x_t，用模型算出反向分布 
+    # p(x_{t-1} | x_t) 的参数，并同时得到模型预测的 x_0。
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
         the initial x, x_0.
@@ -360,6 +386,7 @@ class GaussianDiffusion:
             model_kwargs = {}
 
         B, C = x.shape[:2]
+
         assert t.shape == (B,)
         model_output = model(x, t, **model_kwargs)
         if isinstance(model_output, tuple):
@@ -394,7 +421,7 @@ class GaussianDiffusion:
             model_variance = _extract_into_tensor(model_variance, t, x.shape)
             model_log_variance = _extract_into_tensor(model_log_variance, t, x.shape)
 
-        def process_xstart(x):
+        def process_xstart(x): # 如果传了一个函数，就先对 x_0 做额外处理。如果为真，就把 x_0 裁剪到 [-1,1]
             if denoised_fn is not None:
                 x = denoised_fn(x)
             if clip_denoised:
@@ -407,7 +434,8 @@ class GaussianDiffusion:
             pred_xstart = process_xstart(
                 self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
             )
-        model_mean, _, _ = self.q_posterior_mean_variance(
+        model_mean, _, _ = self.q_posterior_mean_variance( 
+            # 用模型预测的 pred_xstart 和当前 x_t，构造一个“模型认为的后验均值”。
             x_start=pred_xstart, x_t=x, t=t
         )
 
@@ -470,6 +498,7 @@ class GaussianDiffusion:
         return out
 
     def p_sample(
+        
         self,
         model,
         x,
@@ -480,6 +509,7 @@ class GaussianDiffusion:
         model_kwargs=None,
     ):
         """
+        # 已知当前时刻的 x_t，从模型给出的反向分布里采样出下一步 x_{t-1}。这是生成过程的核心采样步骤。
         Sample x_{t-1} from the model at the given timestep.
         :param model: the model to sample from.
         :param x: the current tensor at x_{t-1}.
@@ -499,7 +529,7 @@ class GaussianDiffusion:
             model,
             x,
             t,
-            clip_denoised=clip_denoised,
+            clip_denoised=clip_denoised, # 是否把模型预测出来的 x_0 限制到 [-1, 1] 范围内。
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
         )
@@ -609,6 +639,7 @@ class GaussianDiffusion:
                 img = out["sample"]
 
     def ddim_sample(
+        
         self,
         model,
         x,
@@ -619,6 +650,9 @@ class GaussianDiffusion:
         model_kwargs=None,
         eta=0.0,
     ):
+        """
+        DDIM 采样过程：根据当前时刻的 𝑥𝑡，生成上一个时刻的 𝑥𝑡−1
+        """
         """
         Sample x_{t-1} from the model using DDIM.
         Same usage as p_sample().
@@ -631,6 +665,11 @@ class GaussianDiffusion:
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
         )
+        """
+        out["pred_xstart"]：模型预测的干净样本 𝑥₀
+        out["mean"]：反向分布均值
+        out["log_variance"]：反向分布方差
+        """
         if cond_fn is not None:
             out = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
 
@@ -799,8 +838,8 @@ class GaussianDiffusion:
         )
         kl = normal_kl(
             true_mean, true_log_variance_clipped, out["mean"], out["log_variance"]
-        )
-        kl = mean_flat(kl) / np.log(2.0)
+        )#返回逐元素的 KL
+        kl = mean_flat(kl) / np.log(2.0)#(B, C, H, W) to (B,) 用 bit 为单位表示每个样本的 KL
 
         decoder_nll = -discretized_gaussian_log_likelihood(
             x_start, means=out["mean"], log_scales=0.5 * out["log_variance"]
@@ -832,7 +871,6 @@ class GaussianDiffusion:
         if noise is None:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
-
         terms = {}
 
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
@@ -877,7 +915,8 @@ class GaussianDiffusion:
                 )[0],
                 ModelMeanType.START_X: x_start,
                 ModelMeanType.EPSILON: noise,
-            }[self.model_mean_type]
+            }[self.model_mean_type]#预测的类型在init里面定义
+            # 按 self.model_mean_type 的不同，把训练目标 target 设成“上一步均值” / “原图” / “噪声”中的一个。
             assert model_output.shape == target.shape == x_start.shape
 
             if boxes_mask is not None:

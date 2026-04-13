@@ -2,6 +2,24 @@
 #     GLIDE: https://github.com/openai/glide-text2im/blob/main/glide_text2im/gaussian_diffusion.py
 #     ADM:   https://github.com/openai/guided-diffusion/blob/main/guided_diffusion
 #     IDDPM: https://github.com/openai/improved-diffusion/blob/main/improved_diffusion/gaussian_diffusion.py
+# def create_diffusion(...):
+#     # 1. 先确定 beta schedule
+#     betas = ...
+
+#     # 2. 决定 loss 类型
+#     loss_type = ...
+
+#     # 3. 决定要不要跳步，以及怎么跳
+#     use_timesteps = space_timesteps(...)
+
+#     # 4. 创建 SpacedDiffusion 对象
+#     return SpacedDiffusion(
+#         use_timesteps=use_timesteps,
+#         betas=betas,
+#         model_mean_type=...,
+#         model_var_type=...,
+#         loss_type=loss_type,
+#     )
 
 from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps

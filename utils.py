@@ -14,7 +14,7 @@ from pytorch_fid import fid_score
 
 import pandas as pd
 
-
+# 读取一张图片，用 VAE 编码成 latent，再解码回来，最后返回重建后的图片数组。
 def vae_compress(img_path: str, model_path: str):
     """
     Returns:
@@ -113,7 +113,7 @@ def generate_and_fid(
         total = 0
 
         for iter in pbar:
-            cl_domain = torch.randint(
+            cl_domain = torch.randint(  # 随机抽取的num_domain_class个标签
                 0,
                 num_domain_class,
                 (
@@ -122,6 +122,8 @@ def generate_and_fid(
                         if iter != (epoch - 1)
                         or per_proc_sample_num % per_proc_batch_size == 0
                         else per_proc_sample_num % per_proc_batch_size
+                        # 如果不是最后一个 iteration，或者虽然是最后一个 iteration，
+                        # 但样本数刚好被 batch size 整除，没有剩余样本
                     ),
                 ),
                 device=device,
@@ -188,12 +190,15 @@ def generate_and_fid(
         
         # 计算 FID - 支持递归搜索子目录
         if rank == 0:
-            import tempfile
-            import shutil
-            from pathlib import Path
+            import tempfile  #创建临时文件 / 临时目录。
+            import shutil    #文件操作
+            from pathlib import Path  
             import numpy as np
             from scipy import linalg
-            from pytorch_fid.inception import InceptionV3
+            from pytorch_fid.inception import InceptionV3  #提取图片特征
+            # """用 InceptionV3 提取真实图片特征
+            # 用 InceptionV3 提取生成图片特征
+            # 比较两组特征分布的差异"""
             from pytorch_fid.fid_score import compute_statistics_of_path
             
             def calculate_fid_stable(mu1, sigma1, mu2, sigma2, eps=1e-6):
@@ -215,6 +220,7 @@ def generate_and_fid(
             block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
             inception_model = InceptionV3([block_idx]).to(device)
             inception_model.eval()
+            # 加载一个 InceptionV3 模型，并让它输出 2048 维特征，用于计算 FID，并设置为推理模式。
             
             # 创建临时目录，将所有真实图片复制到一个平坦目录
             with tempfile.TemporaryDirectory() as temp_real_dir:

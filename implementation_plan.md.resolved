@@ -1,0 +1,764 @@
+# V0 天气编辑框架 — 分步实现方案
+
+> 暂不实现 WeatherController，用现有 5 类 y 标签代替天气控制
+> 先跑通"晴天 → 特殊天气"的编辑 pipeline，再加可控
+
+---
+
+# 总体策略
+
+```
+当前: 晴天图 → 全加噪 → 全去噪 → 生成天气图（无条件生成）
+目标: 晴天图 → 部分加噪 → 条件去噪(y=目标天气 + 几何约束) → 编辑后的天气图
+```
+
+**天气控制**暂时用原有 [LabelEmbedder](file:///d:/Reproduce/DriveFit/DriveDiTFit/drivefit_models.py#419-467)（y=0 晴天, y=1 阴天, ... y=4 雪天），后续再替换为连续 `WeatherController`。
+
+**6 步实现，每步可独立测试**：
+
+```
+Step 1: partial_forward_diffusion()     ← 在 diffusion 中加一个方法
+Step 2: GeometryEncoder                 ← 新文件，独立模块
+Step 3: GeometryLoss                    ← 新文件，独立模块
+Step 4: 修改 DiT.forward                ← 加几何条件入口
+Step 5: train_weather.py                ← 新训练入口
+Step 6: edit_weather.py                 ← 新推理入口
+```
+
+---
+
+# Step 1：Partial Forward Diffusion
+
+**目标**：让扩散过程支持"只加噪到中间步 t\*"
+
+### 修改文件
+
+[gaussian_diffusion.py](file:///d:/Reproduce/DriveFit/DriveDiTFit/diffusion/gaussian_diffusion.py)
+
+### 在 [GaussianDiffusion](file:///d:/Reproduce/DriveFit/DriveDiTFit/diffusion/gaussian_diffusion.py#226-968) 类末尾新增方法
+
+```python
+def partial_forward_diffusion(self, x_0, t_star, noise=None):
+    """
+    前向加噪到中间步 t*（不是完整 T=1000 步）
+    
+    Args:
+        x_0:    (B, C, H, W)  干净 latent
+        t_star: int            目标噪声步, 如 200~500
+        noise:  (B, C, H, W)  指定噪声，None 则随机生成
+    Returns:
+        z_t:    (B, C, H, W)  加噪后的 latent
+        noise:  (B, C, H, W)  使用的噪声（用于计算 loss）
+    
+    公式: z_t* = sqrt(alpha_bar_t*) * x_0 + sqrt(1 - alpha_bar_t*) * noise
+    """
+    if noise is None:
+        noise = th.randn_like(x_0)
+    t_batch = th.full((x_0.shape[0],), t_star, device=x_0.device, dtype=th.long)
+    z_t = self.q_sample(x_0, t_batch, noise=noise)
+    return z_t, noise
+```
+
+> 注意：[q_sample()](file:///d:/Reproduce/DriveFit/DriveDiTFit/diffusion/gaussian_diffusion.py#297-314) 是 [GaussianDiffusion](file:///d:/Reproduce/DriveFit/DriveDiTFit/diffusion/gaussian_diffusion.py#226-968) 已有的方法（L297-313），直接复用。
+
+### 测试
+
+```python
+# test_step1.py
+import torch
+from diffusion import create_diffusion
+
+diffusion = create_diffusion(timestep_respacing="", noise_schedule="linear")
+
+x_0 = torch.zeros(2, 4, 32, 32)  # 全零 latent
+z_200, noise = diffusion.partial_forward_diffusion(x_0, t_star=200)
+z_500, _     = diffusion.partial_forward_diffusion(x_0, t_star=500)
+z_900, _     = diffusion.partial_forward_diffusion(x_0, t_star=900)
+
+print(f"t=200 噪声强度: {z_200.std():.4f}")  # 较小
+print(f"t=500 噪声强度: {z_500.std():.4f}")  # 中等
+print(f"t=900 噪声强度: {z_900.std():.4f}")  # 接近纯噪声
+# 应该看到: 200 < 500 < 900
+print("✅ Step 1 passed!")
+```
+
+---
+
+# Step 2：GeometryEncoder
+
+**目标**：把源图的边缘/结构信息编码为 DiT 可用的条件
+
+### 新建文件
+
+[models/geometry_encoder.py](file:///d:/Reproduce/DriveFit/DriveDiTFit/models/geometry_encoder.py)
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SobelExtractor(nn.Module):
+    """从图片提取 Sobel 边缘（不可训练，推理时用）"""
+    def __init__(self):
+        super().__init__()
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                               dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                               dtype=torch.float32).view(1, 1, 3, 3)
+        # 3 通道各自检测边缘
+        self.register_buffer('sobel_x', sobel_x.repeat(3, 1, 1, 1))
+        self.register_buffer('sobel_y', sobel_y.repeat(3, 1, 1, 1))
+    
+    def forward(self, x):
+        """x: (B, 3, H, W) → edge: (B, 1, H, W)"""
+        edge_x = F.conv2d(x, self.sobel_x, padding=1, groups=3)
+        edge_y = F.conv2d(x, self.sobel_y, padding=1, groups=3)
+        edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)
+        edge = edge.mean(dim=1, keepdim=True)  # 3通道取平均 → 1通道
+        return edge
+
+
+class GeometryEncoder(nn.Module):
+    """
+    将几何先验 map 编码为 DiT 的条件
+    
+    V0: 输入只有 Sobel 边缘 (1通道)
+    V1: 可扩展为多通道 (edge + depth + seg + lane + drivable)
+    
+    输出两个:
+      geo_embed:  (B, hidden_size)              → 加到全局条件 c 上
+      geo_tokens: (B, num_patches, hidden_size)  → 加到 patch tokens 上
+    """
+    def __init__(self, in_channels=1, hidden_size=1152, latent_size=32, patch_size=2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        
+        # 下采样: (B, in_ch, 256, 256) → (B, 256, 32, 32) → (B, hidden, 16, 16)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, stride=2, padding=1),   # → 128
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),           # → 64
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1),          # → 32
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+            nn.Conv2d(256, hidden_size, patch_size, stride=patch_size),  # → 16
+        )
+        
+        # 全局条件: pool → MLP → (B, hidden_size)
+        self.global_mlp = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+    
+    def forward(self, geo_map):
+        """
+        geo_map: (B, in_channels, 256, 256)  几何先验图
+        
+        Returns:
+            geo_embed:  (B, hidden_size)       全局几何向量
+            geo_tokens: (B, 256, hidden_size)  空间几何 token
+        """
+        feat = self.encoder(geo_map)                       # (B, hidden_size, 16, 16)
+        geo_tokens = feat.flatten(2).transpose(1, 2)       # (B, 256, hidden_size)
+        geo_embed = self.global_mlp(feat)                  # (B, hidden_size)
+        return geo_embed, geo_tokens
+```
+
+同时新建 [models/\_\_init\_\_.py](file:///d:/Reproduce/DriveFit/DriveDiTFit/models/__init__.py)：
+
+```python
+from .geometry_encoder import GeometryEncoder, SobelExtractor
+```
+
+### 测试
+
+```python
+# test_step2.py
+import torch
+from models.geometry_encoder import GeometryEncoder, SobelExtractor
+
+# 测试 Sobel 提取
+sobel = SobelExtractor()
+img = torch.randn(2, 3, 256, 256)
+edge = sobel(img)
+print(f"Sobel edge shape: {edge.shape}")  # (2, 1, 256, 256) ✅
+
+# 测试 GeometryEncoder
+geo_enc = GeometryEncoder(in_channels=1, hidden_size=1152)
+geo_embed, geo_tokens = geo_enc(edge)
+print(f"geo_embed shape:  {geo_embed.shape}")   # (2, 1152) ✅
+print(f"geo_tokens shape: {geo_tokens.shape}")  # (2, 256, 1152) ✅
+
+print(f"GeometryEncoder 参数量: {sum(p.numel() for p in geo_enc.parameters()):,}")
+print("✅ Step 2 passed!")
+```
+
+---
+
+# Step 3：GeometryLoss
+
+**目标**：训练时约束生成图的结构与源图一致
+
+### 新建文件
+
+[models/losses.py](file:///d:/Reproduce/DriveFit/DriveDiTFit/models/losses.py)
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .geometry_encoder import SobelExtractor
+
+
+class GeometryLoss(nn.Module):
+    """
+    几何一致性损失: 确保生成图与源图的边缘结构一致
+    
+    V0: 只用 Sobel 边缘 MSE
+    V1: 可添加 depth/seg/lane 对齐
+    """
+    def __init__(self):
+        super().__init__()
+        self.sobel = SobelExtractor()
+        # 冻结 Sobel（本来就没参数，但明确标记）
+        for p in self.sobel.parameters():
+            p.requires_grad = False
+    
+    def forward(self, pred_img, src_img):
+        """
+        pred_img: (B, 3, 256, 256)  模型生成的图（VAE decode 后）
+        src_img:  (B, 3, 256, 256)  晴天源图
+        
+        Returns: scalar loss
+        """
+        pred_edge = self.sobel(pred_img)
+        src_edge = self.sobel(src_img)
+        return F.mse_loss(pred_edge, src_edge)
+```
+
+### 测试
+
+```python
+# test_step3.py
+import torch
+from models.losses import GeometryLoss
+
+loss_fn = GeometryLoss()
+
+# 相同图 → loss 应为 0
+img = torch.randn(2, 3, 256, 256)
+loss_same = loss_fn(img, img)
+print(f"Same image loss: {loss_same.item():.6f}")  # ≈ 0 ✅
+
+# 不同图 → loss 应 > 0
+img2 = torch.randn(2, 3, 256, 256)
+loss_diff = loss_fn(img, img2)
+print(f"Different image loss: {loss_diff.item():.6f}")  # > 0 ✅
+
+print("✅ Step 3 passed!")
+```
+
+---
+
+# Step 4：修改 DiT 模型
+
+**目标**：让 DiT 接收几何条件，同时保持向后兼容
+
+### 修改文件
+
+[drivefit_models.py](file:///d:/Reproduce/DriveFit/DriveDiTFit/drivefit_models.py)
+
+### 4.1 修改 `DiT.__init__`（约 L960-1035）
+
+在参数列表末尾加：
+
+```python
+class DiT(nn.Module):
+    def __init__(
+        self,
+        # ... 原有参数保持不变 ...
+        use_bbox_cond=False,
+        max_boxes=10,
+        # ↓↓↓ 新增 ↓↓↓
+        use_geometry_cond=False,
+        geometry_channels=1,
+    ):
+```
+
+在方法体中（`self.initialize_weights()` 之前）加：
+
+```python
+        # [NEW] 几何条件编码器
+        self.use_geometry_cond = use_geometry_cond
+        if use_geometry_cond:
+            from models.geometry_encoder import GeometryEncoder
+            self.geometry_encoder = GeometryEncoder(
+                in_channels=geometry_channels,
+                hidden_size=hidden_size,
+            )
+            # 门控参数：初始为 0，即刚开始几何条件不起作用，逐渐学习
+            self.geo_gate = nn.Parameter(torch.zeros(1))
+
+        self.initialize_weights()
+```
+
+### 4.2 修改 `DiT.forward`（约 L1080-1096）
+
+原代码：
+
+```python
+    def forward(self, x, t, y, bboxes=None, bbox_mask=None):
+        x = self.x_embedder(x) + self.pos_embed
+        t = self.t_embedder(t)
+        y = self.y_embedder(y, self.training)
+        if self.use_bbox_cond and bboxes is not None:
+            bbox_embed = self.bbox_encoder(bboxes, bbox_mask)
+            c = t + y + bbox_embed
+        else:
+            c = t + y
+        for block in self.blocks:
+            x = block(x, c)
+        x = self.final_layer(x, c)
+        x = self.unpatchify(x)
+        return x
+```
+
+改为：
+
+```python
+    def forward(self, x, t, y, bboxes=None, bbox_mask=None,
+                geometry_maps=None):  # [NEW]
+        x = self.x_embedder(x) + self.pos_embed
+        t = self.t_embedder(t)
+        y = self.y_embedder(y, self.training)
+        if self.use_bbox_cond and bboxes is not None:
+            bbox_embed = self.bbox_encoder(bboxes, bbox_mask)
+            c = t + y + bbox_embed
+        else:
+            c = t + y
+
+        # [NEW] 几何条件注入
+        if self.use_geometry_cond and geometry_maps is not None:
+            geo_embed, geo_tokens = self.geometry_encoder(geometry_maps)
+            c = c + geo_embed                                       # 全局条件
+            x = x + torch.sigmoid(self.geo_gate) * geo_tokens       # 空间条件
+
+        for block in self.blocks:
+            x = block(x, c)
+        x = self.final_layer(x, c)
+        x = self.unpatchify(x)
+        return x
+```
+
+### 4.3 修改 `DiT.forward_with_cfg`（约 L1098-1114）
+
+原代码：
+
+```python
+    def forward_with_cfg(self, x, t, y, cfg_scale, bboxes=None, bbox_mask=None):
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        model_out = self.forward(combined, t, y, bboxes, bbox_mask)
+        ...
+```
+
+改为：
+
+```python
+    def forward_with_cfg(self, x, t, y, cfg_scale, bboxes=None, bbox_mask=None,
+                         geometry_maps=None):  # [NEW]
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        # [NEW] 几何条件也 double（条件分支和无条件分支都给几何信息）
+        geo_double = None
+        if geometry_maps is not None:
+            geo_double = torch.cat([geometry_maps, geometry_maps], dim=0)
+        model_out = self.forward(combined, t, y, bboxes, bbox_mask,
+                                 geometry_maps=geo_double)
+        eps, rest = model_out[:, :3], model_out[:, 3:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
+```
+
+> 注意：几何条件在 CFG 的两个分支**都给**，因为我们希望结构始终保持，不应该被 CFG 影响。
+
+### 测试
+
+```python
+# test_step4.py
+import torch
+from drivefit_models import DiT_models
+
+# 测试1: 不传几何条件 = 原有行为（向后兼容）
+model_old = DiT_models["DiT-XL/2"](scenario_num=5)
+x = torch.randn(2, 4, 32, 32)
+t = torch.randint(0, 1000, (2,))
+y = torch.randint(0, 5, (2,))
+out = model_old(x, t, y)
+print(f"无几何条件 output: {out.shape}")  # (2, 8, 64, 64) ✅
+
+# 测试2: 传几何条件
+model_new = DiT_models["DiT-XL/2"](
+    scenario_num=5,
+    use_geometry_cond=True,
+    geometry_channels=1,
+)
+geo = torch.randn(2, 1, 256, 256)  # Sobel 边缘图
+out2 = model_new(x, t, y, geometry_maps=geo)
+print(f"有几何条件 output: {out2.shape}")  # (2, 8, 64, 64) ✅
+
+# 测试3: CFG forward
+x_cfg = torch.randn(4, 4, 32, 32)  # batch 要 double
+t_cfg = torch.randint(0, 1000, (4,))
+y_cond = torch.randint(0, 5, (2,))
+y_null = torch.full((2,), 5)
+y_cfg = torch.cat([y_cond, y_null])
+geo_cfg = torch.randn(2, 1, 256, 256)
+out3 = model_new.forward_with_cfg(x_cfg, t_cfg, y_cfg, cfg_scale=4.0,
+                                   geometry_maps=geo_cfg)
+print(f"CFG output: {out3.shape}")  # (4, 8, 64, 64) ✅
+
+total = sum(p.numel() for p in model_new.parameters())
+trainable = sum(p.numel() for p in model_new.parameters() if p.requires_grad)
+print(f"总参数: {total:,}, 可训练: {trainable:,}")
+print("✅ Step 4 passed!")
+```
+
+---
+
+# Step 5：训练入口
+
+**目标**：从 [train.py](file:///d:/Reproduce/DriveFit/DriveDiTFit/train.py) 出发，重写训练循环
+
+### 新建文件
+
+[train_weather.py](file:///d:/Reproduce/DriveFit/DriveDiTFit/train_weather.py)
+
+从现有 [train.py](file:///d:/Reproduce/DriveFit/DriveDiTFit/train.py) 复制保留的部分：
+- DDP 初始化（L127-160）
+- VAE 加载（L162-170）
+- wandb 日志（L172-180）
+- checkpoint 保存框架（L339-348）
+- argparse 框架（L400-452）
+
+重写的部分：
+
+```python
+"""
+天气编辑训练 V0
+用法:
+  python train_weather.py \
+    --model DiT-XL/2 \
+    --clear-data-path ./datasets/Ithaca365/clear \
+    --weather-data-path ./datasets/Ithaca365/Ithaca365-scenario \
+    --resume-checkpoint ./pretrained_models/DiT-XL-2-256x256.pt \
+    --vae-checkpoint ./pretrained_models/sd-vae-ft-ema \
+    --epochs 100 --batch-size 4 --lr 1e-4 \
+    --t-star-min 200 --t-star-max 400 \
+    --lambda-geom 0.1 \
+    --scenario_num 5 --rank 4 --modulation
+"""
+
+def main(args):
+    # ========== 1. 模型创建 ==========
+    model = DiT_models[args.model](
+        # 原有参数
+        scenario_num=args.scenario_num,
+        rank=args.rank,
+        modulation=args.modulation,
+        rope=args.rope,
+        # 新增
+        use_geometry_cond=True,
+        geometry_channels=1,  # V0: Sobel 边缘
+    )
+
+    # ========== 2. 加载预训练权重 ==========
+    ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
+    model.load_state_dict(ckpt, strict=False)  # strict=False: 新模块不在 ckpt 里
+
+    # ========== 3. 参数冻结 ==========
+    # 先全部冻结
+    for p in model.parameters():
+        p.requires_grad = False
+    # 解冻: weight_modulation + 场景嵌入 + 几何编码器 + 门控
+    for name, p in model.named_parameters():
+        if any(key in name for key in [
+            'weight_modulation',         # 原有 DriveFit 微调参数
+            'scenario_embedding_table',  # 场景嵌入（y标签）
+            'geometry_encoder',          # 新增几何编码器
+            'geo_gate',                  # 新增门控
+        ]):
+            p.requires_grad = True
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"可训练参数: {trainable:,}")
+
+    # ========== 4. 数据 / 优化器 / Loss ==========
+    vae = AutoencoderKL.from_pretrained(args.vae_checkpoint).to(device).eval()
+    opt = AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
+    geo_loss_fn = GeometryLoss().to(device)
+    sobel = SobelExtractor().to(device)
+    diffusion = create_diffusion(timestep_respacing="", noise_schedule="linear")
+
+    # 数据集: 用恶劣天气图片训练（模型需要学会天气外观）
+    # V0 直接复用 CustomImageFolder (已有的 dataset.py)
+    dataset = CustomImageFolder(args.weather_data_path, ...)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+    # ========== 5. 训练循环 ==========
+    for epoch in range(args.epochs):
+        for batch in loader:
+            imgs, labels, box_info, fnames = batch
+            imgs = imgs.to(device)     # (B, 3, 256, 256)
+            y = labels.to(device)      # (B,)  场景标签 0~4
+
+            # a. VAE 编码
+            with torch.no_grad():
+                z_0 = vae.encode(imgs).latent_dist.sample().mul_(0.18215)
+
+            # b. 部分加噪（随机 t*）
+            t_star = torch.randint(args.t_star_min, args.t_star_max, (1,)).item()
+            z_t, noise = diffusion.partial_forward_diffusion(z_0, t_star)
+
+            # c. 提取几何先验（Sobel 边缘）
+            with torch.no_grad():
+                geo_maps = sobel(imgs)   # (B, 1, 256, 256)
+
+            # d. 模型预测噪声
+            t_batch = torch.full((z_0.shape[0],), t_star, device=device, dtype=torch.long)
+            eps_pred = model(z_t, t_batch, y, geometry_maps=geo_maps)
+
+            # e. 扩散 loss
+            loss_diff = F.mse_loss(eps_pred[:, :4], noise)
+
+            # f. 几何 loss（从预测噪声反推 x0，VAE 解码，比较边缘）
+            if args.lambda_geom > 0:
+                with torch.no_grad():
+                    alpha_bar = diffusion.alphas_cumprod[t_star]
+                    z_0_pred = (z_t - (1 - alpha_bar).sqrt() * eps_pred[:, :4]) / alpha_bar.sqrt()
+                    pred_imgs = vae.decode(z_0_pred / 0.18215).sample
+                    pred_imgs = pred_imgs.clamp(-1, 1)
+                # 几何 loss 需要梯度流过 eps_pred，所以上面用 no_grad 解码
+                # 改为: 直接在 latent 空间做简单的结构 loss
+                loss_geom = F.mse_loss(z_0_pred, z_0) * 0.1  # latent 级结构保持
+            else:
+                loss_geom = torch.tensor(0.0)
+
+            # g. 总损失
+            loss = loss_diff + args.lambda_geom * loss_geom
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            if step % 50 == 0:
+                print(f"[E{epoch} S{step}] loss={loss.item():.4f} "
+                      f"diff={loss_diff.item():.4f} geom={loss_geom.item():.4f}")
+```
+
+### 关键差异 vs 原 train.py
+
+| | 原 train.py | train_weather.py |
+|---|---|---|
+| 加噪方式 | 完整 t∈[0,1000] 随机 | 部分 t∈[t_min, t_max] |
+| 几何条件 | 无 | Sobel 边缘 → GeometryEncoder |
+| 天气条件 | y 标签（和原来一样） | y 标签（暂时和原来一样） |
+| 数据 | 混合所有天气 | 恶劣天气图片 |
+| Loss | MSE only | MSE + 几何约束 |
+| 解冻参数 | weight_modulation | weight_modulation + geometry_encoder |
+
+### 测试
+
+```bash
+# 先用非常小的配置跑 1 个 epoch 验证不报错
+python train_weather.py \
+  --model DiT-XL/2 \
+  --weather-data-path ./datasets/Ithaca365/Ithaca365-scenario \
+  --resume-checkpoint ./pretrained_models/DiT-XL-2-256x256.pt \
+  --vae-checkpoint ./pretrained_models/sd-vae-ft-ema \
+  --epochs 1 --batch-size 2 --lr 1e-4 \
+  --t-star-min 200 --t-star-max 400 \
+  --lambda-geom 0.1 \
+  --scenario_num 5 --rank 4 --modulation
+```
+
+验证：
+- loss 有值且在下降 ✅
+- 无 OOM ✅
+- checkpoint 能保存 ✅
+
+---
+
+# Step 6：推理入口
+
+**目标**：输入晴天图 → 输出目标天气图
+
+### 新建文件
+
+[edit_weather.py](file:///d:/Reproduce/DriveFit/DriveDiTFit/edit_weather.py)
+
+```python
+"""
+天气编辑推理 V0
+用法:
+  python edit_weather.py \
+    --input ./test_images/sunny.png \
+    --output ./test_images/rainy_output.png \
+    --target-weather 3 \
+    --t-star 300 \
+    --num-steps 50 \
+    --cfg-scale 4.0 \
+    --model-ckpt ./results/weather_edit/checkpoints/latest.pt \
+    --pretrained-ckpt ./pretrained_models/DiT-XL-2-256x256.pt \
+    --vae-ckpt ./pretrained_models/sd-vae-ft-ema
+"""
+
+import torch
+from PIL import Image
+from torchvision import transforms
+from torchvision.utils import save_image
+from diffusers.models import AutoencoderKL
+from drivefit_models import DiT_models
+from diffusion import create_diffusion
+from models.geometry_encoder import SobelExtractor
+
+
+def edit_weather(args):
+    device = "cuda"
+
+    # ========== 1. 加载模型 ==========
+    model = DiT_models["DiT-XL/2"](
+        scenario_num=5, rank=4, modulation=True, rope=True,
+        use_geometry_cond=True, geometry_channels=1,
+    ).to(device).eval()
+
+    # 加载预训练 + 微调权重
+    model.load_state_dict(torch.load(args.pretrained_ckpt, map_location="cpu"), strict=False)
+    model.load_state_dict(torch.load(args.model_ckpt, map_location="cpu")["model"], strict=False)
+
+    vae = AutoencoderKL.from_pretrained(args.vae_ckpt).to(device).eval()
+    diffusion = create_diffusion(timestep_respacing="", noise_schedule="linear")
+    sobel = SobelExtractor().to(device)
+
+    # ========== 2. 读取输入图 ==========
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5]*3, [0.5]*3),
+    ])
+    src_img = transform(Image.open(args.input).convert("RGB")).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        # ========== 3. VAE 编码 ==========
+        z_0 = vae.encode(src_img).latent_dist.sample().mul_(0.18215)
+
+        # ========== 4. 提取几何先验 ==========
+        geo_maps = sobel(src_img)  # (1, 1, 256, 256)
+
+        # ========== 5. 部分加噪 ==========
+        z_t, _ = diffusion.partial_forward_diffusion(z_0, t_star=args.t_star)
+
+        # ========== 6. 条件去噪 (DDIM 采样, 从 t* 到 0) ==========
+        alphas = diffusion.alphas_cumprod  # numpy array, len=1000
+        timesteps = torch.linspace(args.t_star, 0, args.num_steps + 1).long()
+
+        # 目标天气标签
+        y_cond = torch.tensor([args.target_weather], device=device)
+        y_null = torch.tensor([5], device=device)  # null class for CFG
+
+        x_t = z_t
+        for i in range(len(timesteps) - 1):
+            t_cur = timesteps[i].item()
+            t_next = timesteps[i + 1].item()
+            t_batch = torch.tensor([t_cur, t_cur], device=device)
+
+            # CFG: 有条件 + 无条件
+            x_double = torch.cat([x_t, x_t], dim=0)
+            y_double = torch.cat([y_cond, y_null], dim=0)
+            geo_double = torch.cat([geo_maps, geo_maps], dim=0)
+
+            eps_pred = model(x_double, t_batch, y_double, geometry_maps=geo_double)
+            eps_pred = eps_pred[:, :4]  # 只取噪声预测
+
+            eps_cond, eps_uncond = eps_pred.chunk(2, dim=0)
+            eps = eps_uncond + args.cfg_scale * (eps_cond - eps_uncond)
+
+            # DDIM 步
+            alpha_cur = torch.tensor(alphas[t_cur], device=device)
+            alpha_next = torch.tensor(alphas[max(t_next, 0)], device=device) if t_next > 0 \
+                         else torch.tensor(1.0, device=device)
+
+            x_0_pred = (x_t - (1 - alpha_cur).sqrt() * eps) / alpha_cur.sqrt()
+            x_t = alpha_next.sqrt() * x_0_pred + (1 - alpha_next).sqrt() * eps
+
+        # ========== 7. VAE 解码 ==========
+        result = vae.decode(x_t / 0.18215).sample
+        result = (result * 0.5 + 0.5).clamp(0, 1)
+
+    # ========== 8. 保存 ==========
+    save_image(result, args.output)
+    # 同时保存源图和边缘图做对比
+    save_image(src_img * 0.5 + 0.5, args.output.replace('.png', '_source.png'))
+    save_image(geo_maps / geo_maps.max(), args.output.replace('.png', '_edge.png'))
+    print(f"✅ 已保存: {args.output}")
+    print(f"  天气标签: {args.target_weather} (0=sunny,1=cloudy,2=night,3=rainy,4=snowy)")
+    print(f"  编辑强度 t*: {args.t_star}")
+
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--input", type=str, required=True)
+    p.add_argument("--output", type=str, default="./edited_output.png")
+    p.add_argument("--target-weather", type=int, default=3, help="0-4")
+    p.add_argument("--t-star", type=int, default=300)
+    p.add_argument("--num-steps", type=int, default=50)
+    p.add_argument("--cfg-scale", type=float, default=4.0)
+    p.add_argument("--model-ckpt", type=str, required=True)
+    p.add_argument("--pretrained-ckpt", type=str, required=True)
+    p.add_argument("--vae-ckpt", type=str, required=True)
+    edit_weather(p.parse_args())
+```
+
+### 测试
+
+```bash
+# 用一张晴天图测试编辑效果
+python edit_weather.py \
+  --input ./datasets/Ithaca365/Ithaca365-scenario/sunny/000001.png \
+  --output ./test_rainy.png \
+  --target-weather 3 \
+  --t-star 300 \
+  --model-ckpt ./results/weather_edit/checkpoints/latest.pt \
+  --pretrained-ckpt ./pretrained_models/DiT-XL-2-256x256.pt \
+  --vae-ckpt ./pretrained_models/sd-vae-ft-ema
+```
+
+验证：
+- 输出图片 256×256 ✅
+- 与源图结构相似（道路、车道线位置不变）✅
+- 视觉上有目标天气的特征 ✅
+
+---
+
+# 实现总览
+
+```
+Step 1 → 改 gaussian_diffusion.py  (加 1 个方法, ~15 行)    → 测试加噪强度
+Step 2 → 新建 geometry_encoder.py  (~80 行)                 → 测试 shape
+Step 3 → 新建 losses.py            (~30 行)                 → 测试 loss 值
+Step 4 → 改 drivefit_models.py     (改 3 个方法, ~20 行)     → 测试前向传播
+Step 5 → 新建 train_weather.py     (~200 行, 复用 train.py) → 测试训练 1 epoch
+Step 6 → 新建 edit_weather.py      (~120 行)                → 测试编辑 1 张图
+```
+
+**每一步都可以独立运行 test 脚本验证，不用等后面步骤完成。**

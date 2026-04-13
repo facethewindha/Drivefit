@@ -435,7 +435,7 @@ class LabelEmbedder(nn.Module):
             self.scenario_embedding_table = nn.Embedding(
                 scenario_num + use_cfg_embedding, hidden_size
             )
-
+   
     def token_drop(self, labels, force_drop_ids=None):
         """
         Drops labels to enable classifier-free guidance.
@@ -889,6 +889,7 @@ class FinalLayer(nn.Module):
 
 class DiT(nn.Module):
     def __init__(
+        # 新增参数use_src_cond
         self,
         input_size=32,
         patch_size=2,
@@ -908,11 +909,16 @@ class DiT(nn.Module):
         scenario_num=0,
         rope=False,
         finetune_depth=28,
+        use_src_cond=False,
+        lambda_id=1.0,
+        lambda_edge=0.5,
+        identity_ratio=0.4,
     ):
         super().__init__()
+        self.use_src_cond = use_src_cond #新增参数
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.out_channels = in_channels*2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.modulation = modulation
@@ -922,7 +928,7 @@ class DiT(nn.Module):
         self.x_embedder = PatchEmbed(
             input_size,
             patch_size,
-            in_channels,
+            in_channels*2 if use_src_cond else in_channels, # 8 or 4
             hidden_size,
             bias=True,
             modulation=patch_modulation,
@@ -931,9 +937,29 @@ class DiT(nn.Module):
         self.t_embedder = TimestepEmbedder(
             hidden_size, modulation=modulation, rank=rank
         )
-        self.y_embedder = LabelEmbedder(
-            num_classes, hidden_size, class_dropout_prob, scenario_num=scenario_num
-        )
+        # self.y_embedder = LabelEmbedder(
+        #     num_classes, hidden_size, class_dropout_prob, scenario_num=scenario_num
+        # )
+        # 新增：src/tgt 双条件 embedding（scenario_num > 0 时启用）
+        if scenario_num > 0:
+            self.src_weather_embedder = LabelEmbedder(
+            scenario_num + 1,   # +1 包含 “null‑class”
+            hidden_size,
+            class_dropout_prob,
+            scenario_num=scenario_num
+            )
+            self.tgt_weather_embedder = LabelEmbedder(
+            scenario_num + 1,   # +1 包含 “null‑class”
+            hidden_size,
+            class_dropout_prob,
+            scenario_num=scenario_num
+            )
+            nn.init.normal_(self.src_weather_embedder.embedding_table.weight, std=0.02)
+            nn.init.normal_(self.tgt_weather_embedder.embedding_table.weight, std=0.02)
+            nn.init.normal_(self.src_weather_embedder.scenario_embedding_table.weight, std=0.02)
+            nn.init.normal_(self.tgt_weather_embedder.scenario_embedding_table.weight, std=0.02)
+            
+
         num_patches = self.x_embedder.num_patches
 
         self.pos_embed = nn.Parameter(
@@ -978,7 +1004,7 @@ class DiT(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        # nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
@@ -1003,28 +1029,35 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y=None, y_src=None, y_tgt=None):
         x = (
             self.x_embedder(x) + self.pos_embed
         )  # (N, T, D), where T = H * W / patch_size ** 2
 
         t = self.t_embedder(t)  # (N, D)
-        y = self.y_embedder(y, self.training)  # (N, D)
-        c = t + y  # (N, D)
+        if y_src is not None and y_tgt is not None and self.scenario_num > 0:
+            # 编辑模式：src + tgt 双条件
+            c = t + self.src_weather_embedder(y_src,self.training) + self.tgt_weather_embedder(y_tgt,self.training)
+        elif y is not None:
+            # 生成模式兼容
+            # 
+            pass
+        else:
+            c = t
         for block in self.blocks:
             x = block(x, c)  # (N, T, D)
         x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t,y=None, y_src=None, y_tgt=None, cfg_scale=4.0):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+        model_out = self.forward(combined, t, y=y, y_src=y_src, y_tgt=y_tgt)#更新签名兼容
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
