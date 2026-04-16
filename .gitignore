@@ -212,3 +212,8 @@ exps/
 *.tar.gz
 *.tgz
 *.7z
+
+preview/
+pretrained_models/
+generated_samples/
+Test/

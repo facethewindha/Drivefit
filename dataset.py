@@ -250,3 +250,195 @@ class WeatherEditDataset(Dataset):
             "tgt_label": tgt_label,
             "is_identity": int(is_identity),
         }
+
+
+class PairedWeatherDataset(Dataset):
+    """
+    按文件排序后按索引一一配对:
+      source_imgs[i] <-> target_imgs[i]
+    仅使用前 max_pairs 对（默认 1225 对）。
+    """
+
+    WEATHER_TO_IDX = {"sunny": 0, "rain": 1, "snow": 2, "cloud": 3, "night": 4}
+
+    def __init__(
+        self,
+        data_root,
+        source_weather="sunny",
+        target_weather="rain",
+        transform=None,
+        max_pairs=1225,
+        split="train",
+        train_count=980,
+        val_count=122,
+        test_count=123,
+    ):
+        super().__init__()
+        self.data_root = data_root
+        self.source_weather = source_weather
+        self.target_weather = target_weather
+        self.transform = transform
+
+        source_dir = os.path.join(data_root, source_weather)
+        target_dir = os.path.join(data_root, target_weather)
+
+        if not os.path.isdir(source_dir):
+            raise FileNotFoundError(f"Source weather dir not found: {source_dir}")
+        if not os.path.isdir(target_dir):
+            raise FileNotFoundError(f"Target weather dir not found: {target_dir}")
+
+        valid_exts = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+        source_imgs = sorted(
+            [
+                os.path.join(source_dir, f)
+                for f in os.listdir(source_dir)
+                if f.lower().endswith(valid_exts)
+            ]
+        )
+        target_imgs = sorted(
+            [
+                os.path.join(target_dir, f)
+                for f in os.listdir(target_dir)
+                if f.lower().endswith(valid_exts)
+            ]
+        )
+
+        pair_num = min(len(source_imgs), len(target_imgs), int(max_pairs))
+        if pair_num <= 0:
+            raise RuntimeError(
+                f"No valid pairs found. source={len(source_imgs)}, target={len(target_imgs)}"
+            )
+
+        source_imgs = source_imgs[:pair_num]
+        target_imgs = target_imgs[:pair_num]
+
+        total_need = int(train_count) + int(val_count) + int(test_count)
+        if total_need > pair_num:
+            raise ValueError(
+                f"Requested split size {total_need} exceeds available pair num {pair_num}"
+            )
+
+        if split not in ("train", "val", "test", "all"):
+            raise ValueError(f"Unsupported split: {split}")
+
+        if split == "train":
+            s, e = 0, int(train_count)
+        elif split == "val":
+            s, e = int(train_count), int(train_count) + int(val_count)
+        elif split == "test":
+            s = int(train_count) + int(val_count)
+            e = s + int(test_count)
+        else:  # all
+            s, e = 0, pair_num
+
+        self.source_imgs = source_imgs[s:e]
+        self.target_imgs = target_imgs[s:e]
+        self.src_label = self.WEATHER_TO_IDX[source_weather]
+        self.tgt_label = self.WEATHER_TO_IDX[target_weather]
+
+    def __len__(self):
+        return len(self.source_imgs)
+
+    def __getitem__(self, index):
+        from PIL import Image as PILImage
+
+        src_img = PILImage.open(self.source_imgs[index]).convert("RGB")
+        tgt_img = PILImage.open(self.target_imgs[index]).convert("RGB")
+
+        if self.transform is not None:
+            src_img = self.transform(src_img)
+            tgt_img = self.transform(tgt_img)
+
+        return {
+            "src_img": src_img,
+            "tgt_img": tgt_img,
+            "src_label": self.src_label,
+            "tgt_label": self.tgt_label,
+            "pair_index": index,
+        }
+
+
+class PairedWeatherReconDataset(Dataset):
+    """
+    Stage1 reconstruction dataset built from paired data, but expanded to single-weather items.
+    For each pair i, create two samples:
+      2*i   -> source weather image (e.g. sunny)
+      2*i+1 -> target weather image (e.g. rain)
+    """
+
+    WEATHER_TO_IDX = {"sunny": 0, "rain": 1, "snow": 2, "cloud": 3, "night": 4}
+
+    def __init__(
+        self,
+        data_root,
+        source_weather="sunny",
+        target_weather="rain",
+        transform=None,
+        max_pairs=1225,
+    ):
+        super().__init__()
+        self.data_root = data_root
+        self.source_weather = source_weather
+        self.target_weather = target_weather
+        self.transform = transform
+
+        source_dir = os.path.join(data_root, source_weather)
+        target_dir = os.path.join(data_root, target_weather)
+        if not os.path.isdir(source_dir):
+            raise FileNotFoundError(f"Source weather dir not found: {source_dir}")
+        if not os.path.isdir(target_dir):
+            raise FileNotFoundError(f"Target weather dir not found: {target_dir}")
+
+        valid_exts = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+        source_imgs = sorted(
+            [
+                os.path.join(source_dir, f)
+                for f in os.listdir(source_dir)
+                if f.lower().endswith(valid_exts)
+            ]
+        )
+        target_imgs = sorted(
+            [
+                os.path.join(target_dir, f)
+                for f in os.listdir(target_dir)
+                if f.lower().endswith(valid_exts)
+            ]
+        )
+
+        pair_num = min(len(source_imgs), len(target_imgs), int(max_pairs))
+        if pair_num <= 0:
+            raise RuntimeError(
+                f"No valid pairs found. source={len(source_imgs)}, target={len(target_imgs)}"
+            )
+
+        self.source_imgs = source_imgs[:pair_num]
+        self.target_imgs = target_imgs[:pair_num]
+        self.src_label = self.WEATHER_TO_IDX[source_weather]
+        self.tgt_label = self.WEATHER_TO_IDX[target_weather]
+
+    def __len__(self):
+        return 2 * len(self.source_imgs)
+
+    def __getitem__(self, index):
+        from PIL import Image as PILImage
+
+        pair_idx = index // 2
+        is_source = (index % 2 == 0)
+
+        if is_source:
+            img_path = self.source_imgs[pair_idx]
+            label = self.src_label
+        else:
+            img_path = self.target_imgs[pair_idx]
+            label = self.tgt_label
+
+        img = PILImage.open(img_path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+
+        return {
+            "img": img,
+            "label": label,
+            "pair_index": pair_idx,
+            "is_source": int(is_source),
+        }
